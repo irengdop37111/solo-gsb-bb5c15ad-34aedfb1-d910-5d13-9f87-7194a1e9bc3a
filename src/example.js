@@ -164,3 +164,24 @@ export const EXAMPLE_OWNERSHIP_PREVIEW_REQUEST = {
     { prefix: '/features/tracing', owner: 'B' },
   ],
 };
+
+/**
+ * Canned restart-plan payload, mirrored in examples/restart-plan-request.json.
+ * Planned against a clean record created from EXAMPLE_REQUEST (changed paths:
+ * /features/retries, /features/tracing, /replicas, /servers) it exercises
+ * every plan feature: direct hits on exact and ancestor read paths
+ * (api, config-db, auth), propagation along the reverse of the dependencies
+ * (worker via api, session via the auth<->session cycle), an SCC scheduled
+ * as one group (auth + session), an unaffected service (scheduler, whose
+ * only read /tags did not change) and dependency-first rounds.
+ */
+export const EXAMPLE_RESTART_PLAN_REQUEST = {
+  services: [
+    { id: 'api', reads: ['/servers', '/replicas'], dependsOn: ['config-db'] },
+    { id: 'auth', reads: ['/features/tracing'], dependsOn: ['session'] },
+    { id: 'config-db', reads: ['/features'], dependsOn: [] },
+    { id: 'scheduler', reads: ['/tags'], dependsOn: [] },
+    { id: 'session', reads: [], dependsOn: ['auth'] },
+    { id: 'worker', reads: ['/features/cache'], dependsOn: ['api'] },
+  ],
+};
