@@ -164,3 +164,26 @@ export const EXAMPLE_OWNERSHIP_PREVIEW_REQUEST = {
     { prefix: '/features/tracing', owner: 'B' },
   ],
 };
+
+/**
+ * Canned restart-plan payload, mirrored in examples/restart-plan-request.json.
+ * Evaluated against a clean record created from EXAMPLE_REQUEST it exercises
+ * every orchestration feature: direct hits in both prefix directions
+ * (config-loader reads the changed /features subtree; worker reads inside the
+ * changed /servers array), propagation along reversed dependencies
+ * (dashboard reads nothing changed but depends on api-gateway), a mutual
+ * dependency collapsed into one group (cache <-> session-store, affected via
+ * session-store's read of the added /features/retries) and one untouched
+ * service (billing) left out of the plan.
+ */
+export const EXAMPLE_RESTART_PLAN_REQUEST = {
+  services: [
+    { id: 'api-gateway', reads: ['/replicas', '/features/tracing'], dependsOn: ['config-loader'] },
+    { id: 'billing', reads: ['/app'], dependsOn: [] },
+    { id: 'cache', reads: ['/features/cache'], dependsOn: ['session-store'] },
+    { id: 'config-loader', reads: ['/features'], dependsOn: [] },
+    { id: 'dashboard', reads: ['/tags'], dependsOn: ['api-gateway'] },
+    { id: 'session-store', reads: ['/features/retries'], dependsOn: ['cache'] },
+    { id: 'worker', reads: ['/servers/0/host'], dependsOn: ['api-gateway'] },
+  ],
+};

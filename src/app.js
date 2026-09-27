@@ -12,6 +12,7 @@ import {
   validateOwnershipRules,
   OwnershipError,
 } from './ownership.js';
+import { buildRestartPlan, validateServices, RestartError } from './restart.js';
 import { MergeStore } from './store.js';
 import {
   EXAMPLE_REQUEST,
@@ -20,6 +21,7 @@ import {
   EXAMPLE_REBASE_CONFLICT_REQUEST,
   EXAMPLE_CONSTRAINT_PREVIEW_REQUEST,
   EXAMPLE_OWNERSHIP_PREVIEW_REQUEST,
+  EXAMPLE_RESTART_PLAN_REQUEST,
 } from './example.js';
 
 export const VERSION = '1.0.0';
@@ -99,6 +101,17 @@ const ownershipBodySchema = {
   },
 };
 
+const restartBodySchema = {
+  type: 'object',
+  required: ['services'],
+  additionalProperties: false,
+  properties: {
+    // Per-service shape is validated in the handler so that invalid services
+    // are reported as 422 (INVALID_SERVICES) with per-service details, not 400.
+    services: { type: 'array' },
+  },
+};
+
 function publicRecord(record) {
   const { id, status, merged, conflicts, stats, createdAt } = record;
   return { id, status, merged, conflicts, stats, createdAt };
@@ -169,6 +182,8 @@ export function buildApp(options = {}) {
         'evaluate conditional rules (when <pointer> deep-equals <value>, another <pointer> must exist) on base / A-only / B-only / merged of a clean record and classify merged violations (preexisting / introduced-by-A / introduced-by-B / combination-only), without modifying it',
       'POST /api/v1/merges/:id/ownership-preview':
         'check the saved patchA/patchB operations against path-ownership rules (unique RFC 6901 prefix -> owner A/B): longest-prefix attribution in base coordinates, array inserts attributed to the parent array, other-side descendant rules protected from replace/remove; returns a publishable verdict without modifying the record',
+      'POST /api/v1/merges/:id/restart-plan':
+        'orchestrate service restarts for a clean record: diff base vs merged (missing vs null distinguished, array changes recorded at the array path), match service read pointers against changed paths (either decoded path a segment-prefix of the other), propagate impact along reversed dependsOn edges, then emit restart rounds of ready groups (strongly connected components merged) without modifying the record',
       'POST /api/v1/rebases':
         'rebase { base, patch, onto }: merge the client patch with the base->onto delta and return merged plus an onto-relative rebasedPatch (replayed server-side), or structured conflicts',
       'DELETE /api/v1/merges/:id': 'delete one rehearsal',
@@ -190,6 +205,10 @@ export function buildApp(options = {}) {
       'POST the body below to /api/v1/merges/:id/ownership-preview ' +
       '(works with any stored record, e.g. one created from mergeRequest)',
     ownershipPreviewRequest: EXAMPLE_OWNERSHIP_PREVIEW_REQUEST,
+    restartPlanDescription:
+      'POST the body below to /api/v1/merges/:id/restart-plan ' +
+      '(use the id of a clean merge record, e.g. one created from mergeRequest)',
+    restartPlanRequest: EXAMPLE_RESTART_PLAN_REQUEST,
   }));
 
   app.post('/api/v1/merges', { schema: { body: mergeBodySchema } }, async (req, reply) => {
@@ -469,6 +488,56 @@ export function buildApp(options = {}) {
         createdAt: record.createdAt,
         status: record.status,
         ...preview,
+      };
+    },
+  );
+
+  app.post(
+    '/api/v1/merges/:id/restart-plan',
+    { schema: { body: restartBodySchema } },
+    async (req, reply) => {
+      const record = store.get(req.params.id);
+      if (!record) {
+        return reply.code(404).send({
+          statusCode: 404,
+          error: 'Not Found',
+          message: `no rehearsal stored with id ${req.params.id}`,
+        });
+      }
+      if (record.status !== 'clean') {
+        // Only clean records carry a merged document to diff. The stored
+        // record is never modified.
+        return reply.code(409).send({
+          statusCode: 409,
+          error: 'Conflict',
+          message:
+            `rehearsal ${req.params.id} has status "${record.status}"; ` +
+            'restart plan requires a clean merge record',
+        });
+      }
+      let services;
+      try {
+        services = validateServices(req.body.services);
+      } catch (err) {
+        if (err instanceof RestartError) {
+          return reply.code(422).send({
+            statusCode: 422,
+            error: 'Unprocessable Entity',
+            code: err.code,
+            message: err.message,
+            ...err.details,
+          });
+        }
+        throw err;
+      }
+      // Pure plan: the stored record is never modified. With no changes (or
+      // no service reading a changed path) the plan is empty.
+      const plan = buildRestartPlan(record, services);
+      return {
+        id: record.id,
+        createdAt: record.createdAt,
+        status: record.status,
+        ...plan,
       };
     },
   );

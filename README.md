@@ -41,6 +41,7 @@ npm ci && npm start
 | 变基接口 | `POST http://localhost:3000/api/v1/rebases` |
 | 约束预检接口 | `POST http://localhost:3000/api/v1/merges/:id/constraint-preview` |
 | 归属预检接口 | `POST http://localhost:3000/api/v1/merges/:id/ownership-preview` |
+| 重启编排接口 | `POST http://localhost:3000/api/v1/merges/:id/restart-plan` |
 
 ## 配置项（环境变量）
 
@@ -67,6 +68,7 @@ npm ci && npm start
 | `GET` | `/api/v1/merges/:id/provenance` | 干净合并记录的叶子级来源追踪：`merged` 每个叶子路径标注 `base` / `A` / `B` / `both` 及贡献操作的原始序号 |
 | `POST` | `/api/v1/merges/:id/constraint-preview` | 对干净合并记录提交一组条件规则（`when` 指针值与 `equals` 深度相等时 `require` 指针必须存在），在基准 / A 单独 / B 单独 / 合并结果四种状态上评估并分类合并结果中的违规（不修改记录） |
 | `POST` | `/api/v1/merges/:id/ownership-preview` | 对任意已保存记录提交路径归属规则（唯一 `prefix` → `owner` A/B），按基准坐标最长前缀逐条检查原始操作的归属，返回可发布布尔值与违规明细（不修改记录） |
+| `POST` | `/api/v1/merges/:id/restart-plan` | 对干净合并记录提交服务清单（`id` / `reads` / `dependsOn`），比较 base 与 merged 得出变更路径，命中读取路径后沿依赖反向传播，按强连通分量分组输出重启轮次（不修改记录） |
 | `POST` | `/api/v1/rebases` | 变基预演：把基于 `base` 的 `patch` 迁移到新版本 `onto`，返回 `merged` 与相对 `onto` 的 `rebasedPatch`（服务端重放校验），冲突时不返回可执行补丁 |
 | `DELETE` | `/api/v1/merges/:id` | 删除单条预演（`204`） |
 
@@ -640,6 +642,133 @@ curl -s -X POST "http://localhost:3000/api/v1/merges/$id/ownership-preview" \
 #    owned-by-other / descendant-owned-by-other 三种原因
 ```
 
+### `POST /api/v1/merges/:id/restart-plan`（服务重启编排）
+
+对一条**已保存且合并成功（`status: "clean"`）**的记录，提交一份**服务清单**——每个服务
+声明唯一 `id`、读取配置的 RFC 6901 指针列表 `reads`、依赖的服务 id 列表 `dependsOn`。
+服务递归比较保存的 `base` 与 `merged` 得出变更路径，按「谁读了被改动的配置」算出需要
+重启的服务，并编排**分轮次的重启计划**。**编排不会修改已保存的记录**，同一记录同一请求
+重复提交返回**逐字节一致**的结果。
+
+变更路径的提取规则：
+
+- **对象**逐成员递归比较；仅存在于一侧的成员记该成员路径——**缺失与 `null` 严格区分**
+  （`{"a": null}` 与 `{}` 不同：前者 `/a` 存在且值为 `null`，后者 `/a` 缺失）。
+- **数组**只要两侧不深度相等，只记**数组本身的路径**（不记元素级路径）。
+- 其他差异（标量 / `null` 变化、容器类型互换）记该路径本身；整份文档被替换记根路径 `""`。
+
+直接影响与传播：
+
+- 变更路径与每个服务的 `reads` 指针分别按 RFC 6901 **解码**（`~0` → `~`、`~1` → `/`）
+  后比较：任一路径是另一路径的**段前缀**（含相等）即**直接受影响**——读到的子树被改、
+  或读取位置在被改子树内部，都算命中。根指针 `""` 是任何路径的前缀。
+- 影响沿 `dependsOn` 的**反方向**传播：某服务受影响，则所有（传递地）依赖它的服务都
+  受影响。
+
+编排规则（**仅编排受影响服务**，未受影响的依赖直接忽略）：
+
+- 受影响服务中互相依赖（**强连通分量**）的服务合为**一组**同时重启；
+- **依赖先行**：按 Kahn 分层输出**轮次**——每轮包含依赖已全部落在之前轮次的全部就绪组；
+- 组内服务按 `id` 排序，同轮各组按组内最小 `id` 排序（均为 UTF-16 码元序）。
+
+请求体（也见 `examples/restart-plan-request.json`，或 `GET /api/v1/example`）：
+
+```json
+{
+  "services": [
+    { "id": "api-gateway",   "reads": ["/replicas", "/features/tracing"], "dependsOn": ["config-loader"] },
+    { "id": "billing",       "reads": ["/app"],            "dependsOn": [] },
+    { "id": "cache",         "reads": ["/features/cache"], "dependsOn": ["session-store"] },
+    { "id": "config-loader", "reads": ["/features"],       "dependsOn": [] },
+    { "id": "dashboard",     "reads": ["/tags"],           "dependsOn": ["api-gateway"] },
+    { "id": "session-store", "reads": ["/features/retries"], "dependsOn": ["cache"] },
+    { "id": "worker",        "reads": ["/servers/0/host"], "dependsOn": ["api-gateway"] }
+  ]
+}
+```
+
+- `id`：非空字符串，清单内唯一；`reads`：RFC 6901 JSON Pointer 数组（`""` 表示文档根，
+  `~0` / `~1` 转义），空数组合法（只可能被传播影响）；`dependsOn`：服务 id 数组，每个
+  引用必须出现在清单中，空数组合法。
+- 三个字段均为必填，不识别多余字段；`services` 空数组合法。
+
+#### 响应结构（`200`）
+
+以 `examples/merge-request.json` 创建记录、再提交
+`examples/restart-plan-request.json` 为例：
+
+```jsonc
+{
+  "id": "...",
+  "createdAt": "...",
+  "status": "clean",
+  // base -> merged 的变更路径（数组只记数组路径），按 UTF-16 码元序排序
+  "changedPaths": ["/features/retries", "/features/tracing", "/replicas", "/servers"],
+  // 直接命中的服务：命中的读取指针与对应的变更路径（均按 id / 指针排序）
+  "directHits": [
+    { "service": "api-gateway",
+      "reads": ["/features/tracing", "/replicas"],
+      "changedPaths": ["/features/tracing", "/replicas"] },
+    { "service": "config-loader",
+      "reads": ["/features"],
+      "changedPaths": ["/features/retries", "/features/tracing"] },
+    { "service": "session-store",
+      "reads": ["/features/retries"],
+      "changedPaths": ["/features/retries"] },
+    { "service": "worker",
+      "reads": ["/servers/0/host"],
+      "changedPaths": ["/servers"] }
+  ],
+  // 传播后的全部受影响服务（按 id 排序）：dashboard 没读变更路径但依赖
+  // api-gateway；cache 与 session-store 互相依赖被一并卷入；billing 不受影响
+  "affected": ["api-gateway", "cache", "config-loader", "dashboard",
+               "session-store", "worker"],
+  // 重启轮次：每轮是全部就绪组的列表，每组是强连通分量（组内按 id 排序）
+  "rounds": [
+    [ ["cache", "session-store"], ["config-loader"] ],
+    [ ["api-gateway"] ],
+    [ ["dashboard"], ["worker"] ]
+  ],
+  "summary": { "services": 7, "changedPaths": 4, "directlyAffected": 4,
+               "affected": 6, "groups": 5, "rounds": 3 }
+}
+```
+
+可以看到：`cache` ↔ `session-store` 互相依赖被合为一组（组内按 id 排序）放在第 0 轮；
+`dashboard` / `worker` 本身没读到变更，因依赖 `api-gateway` 被传播进计划并排在最后；
+`billing` 读取的 `/app` 未变且无依赖牵连，不出现在计划中。
+
+#### 状态码与确定性
+
+- **干净记录 → `200`**：返回上述结构。`base` 与 `merged` 深度相等（或没有任何服务读到
+  变更路径）时返回**空计划**：`changedPaths` / `directHits` / `affected` / `rounds`
+  均为空数组。
+- **服务清单无效 → `422`**：
+  `{ statusCode, error, code: "INVALID_SERVICES", message, invalid: [...] }`；
+  `invalid` 按请求顺序列出每项问题服务的 `index`、`id`（无法解析时为 `null`）与
+  `issues`（非对象、缺字段、`id` 为空或重复、`reads` 指针非法、`dependsOn` 引用未知
+  服务、多余字段等）。
+- **记录不存在 → `404`**；**记录为冲突状态（`status: "conflict"`）→ `409`**（无
+  `merged` 可比较，不修改记录；`409` 先于服务清单校验）；请求体缺 `services` 等结构
+  问题 → `400`。
+- 编排是已保存记录与请求清单的**纯函数**：不修改记录，同一请求重复提交返回逐字节一致
+  的结果。
+
+完整流程示例：
+
+```bash
+# 1) 用干净合并示例创建记录，记下 id
+id=$(curl -s -X POST http://localhost:3000/api/v1/merges \
+  -H 'Content-Type: application/json' \
+  -d @examples/merge-request.json | jq -r .id)
+
+# 2) 提交服务清单，获取重启编排计划
+curl -s -X POST "http://localhost:3000/api/v1/merges/$id/restart-plan" \
+  -H 'Content-Type: application/json' \
+  -d @examples/restart-plan-request.json | jq
+# => 200；4 条变更路径、4 个直接命中、传播后 6 个受影响服务、3 轮重启计划
+```
+
 ### `POST /api/v1/rebases`（变基预演）
 
 把一份**基于旧版本 `base` 的待发布补丁**迁移到上游新版本 `onto` 上。服务先把 `base` → `onto`
@@ -830,6 +959,9 @@ curl -s -X POST http://localhost:3000/api/v1/merges/<id>/constraint-preview \
 curl -s -X POST http://localhost:3000/api/v1/merges/<id>/ownership-preview \
   -H 'Content-Type: application/json' \
   -d @examples/ownership-preview-request.json | jq                     # 路径归属预检（可发布判定 + 违规明细）
+curl -s -X POST http://localhost:3000/api/v1/merges/<id>/restart-plan \
+  -H 'Content-Type: application/json' \
+  -d @examples/restart-plan-request.json | jq                          # 服务重启编排（变更路径 + 传播 + 轮次）
 curl -s -X POST http://localhost:3000/api/v1/rebases \
   -H 'Content-Type: application/json' \
   -d @examples/rebase-request.json | jq                                # 变基预演（merged + rebasedPatch）
@@ -907,7 +1039,12 @@ rebasedPatch 重放校验、同缝隙上游优先定序、冲突 `409`（路径/
 以及路径归属预检的最长前缀归属（含 RFC 6901 转义与根前缀）、数组插入按父数组归属、
 replace/remove/覆盖式 add 的后代规则保护（逐条命中、按前缀排序）、未覆盖路径违规、
 原始操作逐条检查（含会被合并丢弃的操作）、冲突记录可用（`200`）、无效规则 `422`、
-未知记录 `404`、记录不变与重复请求逐字节一致等。
+未知记录 `404`、记录不变与重复请求逐字节一致，以及服务重启编排的递归变更提取
+（缺失与 `null` 区分、数组只记数组路径、根替换与转义键）、段前缀双向命中
+（含根指针、字符串前缀不等于段前缀）、依赖反向传播（链式 / 菱形 / 未受影响依赖忽略）、
+强连通分量合组（含自依赖）与 Kahn 分层轮次（组内与同轮组间按 id 排序）、
+空计划（无变化 / 无人命中 / 空清单）、无效清单 `422`（非法指针 / 重复 id / 未知依赖
+逐条列出）、冲突记录 `409`、未知记录 `404`、记录不变与重复请求逐字节一致等。
 
 ## 项目结构
 
@@ -923,6 +1060,7 @@ replace/remove/覆盖式 add 的后代规则保护（逐条命中、按前缀排
 │   ├── provenance.js          # 叶子来源追踪：在带来源标签的镜像文档上重放基准坐标合并，归属 merged 每个叶子（base/A/B/both）
 │   ├── constraint.js          # 条件约束预检：规则校验（422）→ 基准/A 单独/B 单独/合并结果四状态评估 → 合并违规归因（既存/A/B/组合）
 │   ├── ownership.js           # 路径归属预检：规则校验（422）→ 基准坐标最长前缀归属 → 逐条检查原始操作（数组插入按父数组、后代规则保护）→ 可发布判定
+│   ├── restart.js             # 服务重启编排：base/merged 递归 diff（缺失与 null 区分、数组记数组路径）→ 段前缀命中 → 依赖反向传播 → 强连通分量分组 + Kahn 分层轮次
 │   ├── rebase.js              # 变基：base→onto 转基准坐标操作（数组 LCS 对齐、缝隙插入）→ 与客户端补丁合并 → 生成并重放校验 onto 相对补丁
 │   ├── store.js               # 内存存储（FIFO 淘汰）
 │   └── example.js             # 内置示例请求
@@ -958,6 +1096,13 @@ replace/remove/覆盖式 add 的后代规则保护（逐条命中、按前缀排
   `replace` / `remove`（含覆盖已有对象成员的 `add`）若覆盖到归属另一方的后代规则也
   逐条判违规，防止父节点写入绕过保护。预检不修改记录，干净与冲突记录均可用（不依赖
   `merged`），无效规则返回 `422` 并逐条列出问题，记录不存在返回 `404`。
+- 服务重启编排（`POST /api/v1/merges/:id/restart-plan`）把「服务 → 读取指针 + 依赖」
+  清单作用于干净记录的 `base` / `merged`：递归比较得出变更路径（缺失与 `null` 区分，
+  数组变化只记数组路径），读取路径与变更路径解码后互为段前缀即直接受影响，影响沿
+  `dependsOn` 反方向传播；仅受影响服务参与编排——强连通分量合为一组，按依赖先行
+  分层输出每轮全部就绪组，组内与同轮组间按 id 排序。编排不修改记录，无变化时返回
+  空计划，非法指针 / 重复 id / 未知依赖返回 `422` 并逐条列出问题，冲突记录返回
+  `409`，记录不存在返回 `404`。
 - 变基（`POST /api/v1/rebases`）是无状态预演：不写内存存储、不返回记录 `id`；`upstream`
   为 `base`→`onto` 的基准坐标操作（数组合并按缝隙寻址，不能直接当顺序补丁执行），
   `rebasedPatch` 才是相对 `onto` 的可执行 RFC 6902 补丁（服务端已重放校验等于 `merged`）；

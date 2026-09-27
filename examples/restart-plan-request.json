@@ -1,0 +1,11 @@
+{
+  "services": [
+    { "id": "api-gateway", "reads": ["/replicas", "/features/tracing"], "dependsOn": ["config-loader"] },
+    { "id": "billing", "reads": ["/app"], "dependsOn": [] },
+    { "id": "cache", "reads": ["/features/cache"], "dependsOn": ["session-store"] },
+    { "id": "config-loader", "reads": ["/features"], "dependsOn": [] },
+    { "id": "dashboard", "reads": ["/tags"], "dependsOn": ["api-gateway"] },
+    { "id": "session-store", "reads": ["/features/retries"], "dependsOn": ["cache"] },
+    { "id": "worker", "reads": ["/servers/0/host"], "dependsOn": ["api-gateway"] }
+  ]
+}
